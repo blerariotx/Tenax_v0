@@ -29,6 +29,7 @@ TENAX_CARD_BORDER = "#E0ECEA"
 FONT_LINK = "https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700&display=swap"
 
 def load_data():
+    date_carteira = "N/A"
     if CSV_CARTEIRA_TX and CSV_CARTEIRA_NEW_ATUAL and CSV_SUMMARY_TX:
         carteira_tx = pd.read_csv(CSV_CARTEIRA_TX)
         carteira_new = pd.read_csv(CSV_CARTEIRA_NEW_ATUAL)
@@ -38,7 +39,14 @@ def load_data():
         carteira_tx = pd.read_excel(EXCEL_FILE, sheet_name="CarteiraTX")
         carteira_new = pd.read_excel(EXCEL_FILE, sheet_name="CarteiraNew_Atual")
         summary_tx = pd.read_excel(EXCEL_FILE, sheet_name="Summary_TX", header=3)
+        try:
+            meta_tx = pd.read_excel(EXCEL_FILE, sheet_name="Summary_TX", header=None, nrows=10)
+            date_carteira = meta_tx.iloc[4, 2]
+        except Exception as e:
+            print("Could not read date from C5", e)
         print("Data loaded successfully.")
+    if hasattr(carteira_tx, "attrs"):
+        carteira_tx.attrs["data_atualizacao"] = date_carteira
     return carteira_tx, carteira_new, summary_tx
 
 def prepare_globals(carteira_tx, carteira_new, summary_tx):
@@ -281,24 +289,28 @@ def load_precos():
     df_raw = pd.read_excel(DADOS_FILE, sheet_name="CockPit Secundário - Tabela", header=None)
     data_rows = df_raw.iloc[11:].reset_index(drop=True)
     records = []
+    
+    def safe_get_col(r, idx, raw=False):
+        if len(r) <= idx: return None
+        return r.iloc[idx] if raw else _safe_float(r.iloc[idx])
+
     for _, row in data_rows.iterrows():
-        ticker    = row.iloc[1]
-        emissor   = row.iloc[2]
-        setor     = row.iloc[3]
-        rating    = row.iloc[7]
-        indexador = row.iloc[10]
-        duration  = row.iloc[14]
-        vol_raw   = row.iloc[8]
+        ticker    = safe_get_col(row, 1, raw=True)
+        emissor   = safe_get_col(row, 2, raw=True)
+        setor     = safe_get_col(row, 3, raw=True)
+        incentivada = safe_get_col(row, 5, raw=True)  # Coluna F
+        rating    = safe_get_col(row, 9, raw=True)  # Coluna J
+        vol_raw   = safe_get_col(row, 8, raw=True)
+        indexador = safe_get_col(row, 13, raw=True)  # Coluna N
+        duration  = safe_get_col(row, 17, raw=True)  # Coluna R
 
         if not isinstance(ticker, str) or ticker.strip() == "":
             continue
         if not isinstance(indexador, str) or indexador not in ("CDI", "IPCA"):
             continue
 
-        spread_raw = row.iloc[16] if indexador == "CDI" else row.iloc[17]
-        spread = _safe_float(spread_raw)
-        dur    = _safe_float(duration)
-        if spread is None or dur is None:
+        dur = _safe_float(duration)
+        if dur is None:
             continue
 
         vol_fin = _safe_float(vol_raw, default=0.0) or 0.0
@@ -306,85 +318,158 @@ def load_precos():
         if rat in ("0", "nan", ""):
             rat = "sem rating"
 
+        set_str = str(setor).strip() if isinstance(setor, str) else "Não Classificado"
+        if set_str in ("nan", "None", ""):
+            set_str = "Não Classificado"
+            
+        em_str = str(emissor).strip() if isinstance(emissor, str) else "Não Classificado"
+        if em_str in ("nan", "None", ""):
+            em_str = "Não Classificado"
+
+        inc_str = "Sim" if str(incentivada).strip().lower() == "sim" else "Não"
+
         records.append({
             "Ticker":    ticker.strip(),
-            "Emissor":   str(emissor).strip() if isinstance(emissor, str) else "",
-            "Setor":     str(setor).strip() if isinstance(setor, str) else "",
+            "Emissor":   em_str,
+            "Setor":     set_str,
+            "Incentivada": inc_str,
             "Rating":    rat,
-            "Indexador": "CDI" if indexador == "CDI" else "IPCA+",
+            "Indexador": indexador,
             "Duration":  round(dur, 4),
-            "Spread":    round(spread, 4),
             "Vol_Fin":   vol_fin,
             "Size":      round(_calc_size(vol_fin), 4),
+            "Yield_Absoluto_Bruto": safe_get_col(row, 18),
+            "Spread_CDI_Bruto": safe_get_col(row, 19),
+            "Spread_IPCA_Bruto": safe_get_col(row, 20),
+            "Spread_PctCDI_Bruto": safe_get_col(row, 21),
+            "Yield_Absoluto_GrossUp": safe_get_col(row, 22),
+            "Spread_CDI_GrossUp": safe_get_col(row, 23),
+            "Spread_IPCA_GrossUp": safe_get_col(row, 24),
+            "Spread_PctCDI_GrossUp": safe_get_col(row, 25),
+            "Yield_Absoluto_GrossDown": safe_get_col(row, 26),
+            "Spread_CDI_GrossDown": safe_get_col(row, 27),
+            "Spread_IPCA_GrossDown": safe_get_col(row, 28),
+            "Spread_PctCDI_GrossDown": safe_get_col(row, 29),
         })
     print(f"Precos loaded: {len(records)} ativos.")
-    return pd.DataFrame(records)
+    df_out = pd.DataFrame(records)
+    try:
+        df_out.attrs["data_atualizacao"] = df_raw.iloc[2, 1]
+    except Exception:
+        df_out.attrs["data_atualizacao"] = "N/A"
+    return df_out
 
 
-def build_precos_fig(df_precos, indexador_filter, rating_filter, setor_filter):
+def build_precos_fig(df_precos, view_col, gross_col, indexador_filter, rating_filter, setor_filter, emissor_filter, color_by="Setor"):
     if df_precos.empty:
         return go.Figure()
 
     df = df_precos.copy()
-    if indexador_filter and indexador_filter != "Todos":
-        df = df[df["Indexador"] == indexador_filter]
     
-    if rating_filter is not None:
-        if len(rating_filter) == 0:
-            df = df.iloc[0:0]
-        else:
-            df = df[df["Rating"].isin(rating_filter)]
+    # Filters
+    if indexador_filter:
+        df = df[df["Indexador"].isin(indexador_filter)]
     else:
         df = df.iloc[0:0]
+    
+    if rating_filter:
+        df = df[df["Rating"].isin(rating_filter)]
 
-    if setor_filter is not None:
-        if len(setor_filter) == 0:
-            df = df.iloc[0:0]
-        else:
-            df = df[df["Setor"].isin(setor_filter)]
-    else:
-        df = df.iloc[0:0]
+    if setor_filter:
+        df = df[df["Setor"].isin(setor_filter)]
+
+    if emissor_filter:
+        df = df[df["Emissor"].isin(emissor_filter)]
 
     if df.empty:
         return go.Figure()
 
+    # Determine Y Column
+    col_map = {
+        ("Yields Absolutos", "Retorno Bruto"): "Yield_Absoluto_Bruto",
+        ("Yields Absolutos", "Retorno com Gross-Up"): "Yield_Absoluto_GrossUp",
+        ("Yields Absolutos", "Retorno com Gross-Down"): "Yield_Absoluto_GrossDown",
+        ("Spread Equivalente CDI+", "Retorno Bruto"): "Spread_CDI_Bruto",
+        ("Spread Equivalente CDI+", "Retorno com Gross-Up"): "Spread_CDI_GrossUp",
+        ("Spread Equivalente CDI+", "Retorno com Gross-Down"): "Spread_CDI_GrossDown",
+        ("Spread Equivalente IPCA+", "Retorno Bruto"): "Spread_IPCA_Bruto",
+        ("Spread Equivalente IPCA+", "Retorno com Gross-Up"): "Spread_IPCA_GrossUp",
+        ("Spread Equivalente IPCA+", "Retorno com Gross-Down"): "Spread_IPCA_GrossDown",
+        ("Spread Equivalente %CDI", "Retorno Bruto"): "Spread_PctCDI_Bruto",
+        ("Spread Equivalente %CDI", "Retorno com Gross-Up"): "Spread_PctCDI_GrossUp",
+        ("Spread Equivalente %CDI", "Retorno com Gross-Down"): "Spread_PctCDI_GrossDown",
+    }
+
+    mapped_col = col_map.get((view_col, gross_col), "Yield_Absoluto_Bruto")
+
+    if "Tenax_Expo_Pct" in df.columns:
+        expo_str = df["Tenax_Expo_Pct"].apply(lambda x: f" ({x:.2%})" if x > 0 else "")
+    else:
+        expo_str = ""
+
+    df["HoverText"] = (
+        "<b>Ticker:</b> " + df["Ticker"] + expo_str + "<br>" +
+        "<b>Emissor:</b> " + df["Emissor"] + "<br>" +
+        "<b>Setor:</b> " + df["Setor"] + "<br>" +
+        "<b>Incentivada:</b> " + df["Incentivada"] + "<br>" +
+        "<b>Rating:</b> " + df["Rating"] + "<br>" +
+        f"<b>{view_col} ({gross_col}):</b> " + df[mapped_col].apply(lambda x: f"{x:.2%}" if pd.notna(x) else "N/A") + "<br>" +
+        "<b>Duration:</b> " + df["Duration"].round(2).astype(str) + " anos<br>" +
+        "<b>Vol Fin:</b> R$ " + df["Vol_Fin"].apply(lambda x: f"{x:,.0f}")
+    )
+
+    if color_by == "Tenax x Mercado":
+        def calc_plot_size(row):
+            if row["Tenax x Mercado"] == "Mercado":
+                return 7
+            return min(100, max(7, 8 + row["Tenax_Expo_Pct"] * 1000))
+        df["PlotSize"] = df.apply(calc_plot_size, axis=1)
+    else:
+        df["PlotSize"] = df["Size"]
+
     import plotly.colors
-    setores = sorted(df["Setor"].unique())
-    palette = plotly.colors.qualitative.Plotly + plotly.colors.qualitative.Pastel + plotly.colors.qualitative.Set3
-    color_map = {s: palette[i % len(palette)] for i, s in enumerate(setores)}
+    color_map = {}
+    colors_list = plotly.colors.qualitative.Plotly + plotly.colors.qualitative.Set3 + plotly.colors.qualitative.D3
+    
+    unique_vals = list(df[color_by].unique())
+    if color_by == "Rating":
+        r_order = {"AAA": 1, "AA+": 2, "AA": 3, "AA-": 4, "A+": 5, "A": 6, "A-": 7, "BBB+": 8, "BBB": 9, "BB+": 10, "sem rating": 11}
+        unique_vals.sort(key=lambda x: r_order.get(x, 99))
+    elif color_by == "Tenax x Mercado":
+        unique_vals = sorted(unique_vals, key=lambda x: 0 if x == "Tenax" else 1)
+    else:
+        unique_vals.sort()
+
+    for s in unique_vals:
+        if s not in color_map:
+            if color_by == "Tenax x Mercado":
+                color_map[s] = TENAX_PRIMARY if s == "Tenax" else TENAX_LIGHT
+            else:
+                color_map[s] = colors_list[len(color_map) % len(colors_list)]
 
     fig = go.Figure()
-    for label, grp in df.groupby("Setor", dropna=False):
-        setor_label = str(label)
+
+    for s in unique_vals:
+        df_sub = df[df[color_by] == s]
         fig.add_trace(go.Scatter(
-            x=grp["Duration"],
-            y=grp["Spread"],
-            mode="markers",
-            name=setor_label,
-            marker=dict(
-                size=grp["Size"],
-                color=color_map.get(label, TENAX_LIGHT),
-                opacity=0.75,
-                line=dict(width=1, color="white"),
-            ),
-            text=grp.apply(lambda r: (
-                f"<b>{r['Ticker']}</b><br>"
-                f"Emissor: {r['Emissor']}<br>"
-                f"Setor: {r['Setor']}<br>"
-                f"Rating: {r['Rating']}<br>"
-                f"Indexador: {r['Indexador']}<br>"
-                f"Duration: {r['Duration']:.2f} anos<br>"
-                f"Spread: {r['Spread']:.2%}<br>"
-                f"Vol Fin: R$ {r['Vol_Fin']:,.0f}"
-            ), axis=1),
+            x=df_sub["Duration"],
+            y=df_sub[mapped_col],
+            mode='markers',
+            marker=dict(size=df_sub["PlotSize"], color=color_map[s], opacity=0.8,
+                        line=dict(width=1, color='white')),
+            name=str(s),
+            text=df_sub["HoverText"],
             hoverinfo="text",
+            # textposition="top center", # Removed text labels on points for cleaner look
+            # textfont=dict(size=10, color="#aaa"),
+            showlegend=True
         ))
 
-    x_label = "Duration CDI" if (indexador_filter == "CDI") else ("Duration IPCA+" if indexador_filter == "IPCA+" else "Duration")
-    y_label = "Spread CDI+" if (indexador_filter != "IPCA+") else "Spread IPCA+"
+    x_label = "Duration (anos)"
+    y_label = f"{view_col} ({gross_col})"
 
     fig.update_layout(
-        title=dict(text="Preços de Ativos — CDI Liquidez", font=dict(size=14, color=TENAX_DARK), x=0),
+        title=dict(text="Preços de Ativos — Análise de Taxas", font=dict(size=14, color=TENAX_DARK), x=0),
         xaxis=dict(title=x_label, showgrid=True, gridcolor=TENAX_CARD_BORDER, zeroline=False),
         yaxis=dict(title=y_label, tickformat=".2%", showgrid=True, gridcolor=TENAX_CARD_BORDER, zeroline=False),
         plot_bgcolor=TENAX_WHITE,
@@ -392,41 +477,88 @@ def build_precos_fig(df_precos, indexador_filter, rating_filter, setor_filter):
         margin=dict(l=60, r=160, t=60, b=60),
         height=650,
         font=dict(family="Montserrat, sans-serif", size=11),
-        legend=dict(orientation="v", title="Setores", yanchor="top", y=1, xanchor="left", x=1.02),
+        legend=dict(orientation="v", title=color_by, yanchor="top", y=1, xanchor="left", x=1.02),
         hovermode="closest",
     )
     return fig
 
 
-def _precos_tab_layout(df_precos):
-    indexadores = ["Todos", "CDI", "IPCA+"]
-    ratings = sorted(df_precos["Rating"].dropna().unique().tolist()) if not df_precos.empty else []
+def _precos_tab_layout(df_precos, date_precos=""):
+    indexadores = ["CDI", "IPCA"]
+    views = ["Yields Absolutos", "Spread Equivalente CDI+", "Spread Equivalente IPCA+", "Spread Equivalente %CDI"]
+    gross = ["Retorno Bruto", "Retorno com Gross-Up", "Retorno com Gross-Down"]
+    
+    ideal_order = {"AAA": 1, "AA+": 2, "AA": 3, "AA-": 4, "A+": 5, "A": 6, "A-": 7, "BBB+": 8, "BBB": 9, "BB+": 10, "sem rating": 11}
+    ratings_raw = df_precos["Rating"].dropna().unique().tolist() if not df_precos.empty else []
+    ratings = sorted(ratings_raw, key=lambda x: ideal_order.get(x, 99))
+    
     setores = sorted(df_precos["Setor"].dropna().unique().tolist()) if not df_precos.empty else []
+    emissores = sorted(df_precos["Emissor"].dropna().unique().tolist()) if not df_precos.empty else []
 
     return html.Div([
-        # Controls
+        # Controls Row 1
         html.Div(style={"display": "flex", "gap": "20px", "alignItems": "flex-end",
-                        "marginBottom": "24px", "flexWrap": "wrap"}, children=[
-            html.Div(style={"minWidth": "180px"}, children=[
+                        "marginBottom": "16px", "flexWrap": "wrap"}, children=[
+            html.Div(style={"minWidth": "200px", "flex": "1"}, children=[
                 html.Label("INDEXADOR", style=_label_style()),
                 dcc.Dropdown(id="precos-indexador",
                              options=[{"label": i, "value": i} for i in indexadores],
-                             value="Todos", clearable=False,
+                             value=["CDI", "IPCA"], clearable=True, multi=True, placeholder="Todos",
                              style={"fontSize": "13px", "fontFamily": "'Montserrat', sans-serif"}),
             ]),
-            html.Div(style={"minWidth": "300px", "flex": "1"}, children=[
+            html.Div(style={"minWidth": "200px", "flex": "1"}, children=[
+                html.Label("MÉTRICA DE CARREGO", style=_label_style()),
+                dcc.Dropdown(id="precos-view",
+                             options=[{"label": v, "value": v} for v in views],
+                             value="Yields Absolutos", clearable=False, multi=False,
+                             style={"fontSize": "13px", "fontFamily": "'Montserrat', sans-serif"}),
+            ]),
+            html.Div(style={"minWidth": "200px", "flex": "1"}, children=[
+                html.Label("MÉTRICA DE IMPOSTO", style=_label_style()),
+                dcc.Dropdown(id="precos-gross",
+                             options=[{"label": g, "value": g} for g in gross],
+                             value="Retorno Bruto", clearable=False, multi=False,
+                             style={"fontSize": "13px", "fontFamily": "'Montserrat', sans-serif"}),
+            ]),
+            html.Div(style={"minWidth": "200px", "flex": "1"}, children=[
+                html.Label("COR DAS BOLHAS", style=_label_style()),
+                dcc.Dropdown(id="precos-color-by",
+                             options=[{"label": "Setor", "value": "Setor"},
+                                      {"label": "Rating", "value": "Rating"},
+                                      {"label": "Indexador", "value": "Indexador"},
+                                      {"label": "Incentivada", "value": "Incentivada"},
+                                      {"label": "Tenax x Mercado", "value": "Tenax x Mercado"}],
+                             value="Setor", clearable=False, multi=False,
+                             style={"fontSize": "13px", "fontFamily": "'Montserrat', sans-serif"}),
+            ]),
+        ]),
+        # Controls Row 2
+        html.Div(style={"display": "flex", "gap": "20px", "alignItems": "flex-end",
+                        "marginBottom": "24px", "flexWrap": "wrap"}, children=[
+            html.Div(style={"minWidth": "250px", "flex": "1"}, children=[
                 html.Label("RATING", style=_label_style()),
                 dcc.Dropdown(id="precos-rating",
                              options=[{"label": r, "value": r} for r in ratings],
-                             value=ratings, clearable=True, multi=True,
+                             value=[], clearable=True, multi=True, placeholder="Todos",
                              style={"fontSize": "13px", "fontFamily": "'Montserrat', sans-serif"}),
             ]),
-            html.Div(style={"minWidth": "300px", "flex": "1"}, children=[
+            html.Div(style={"minWidth": "250px", "flex": "1"}, children=[
                 html.Label("SETOR", style=_label_style()),
                 dcc.Dropdown(id="precos-setor",
                              options=[{"label": s, "value": s} for s in setores],
-                             value=setores, clearable=True, multi=True,
+                             value=[], clearable=True, multi=True, placeholder="Todos",
                              style={"fontSize": "13px", "fontFamily": "'Montserrat', sans-serif"}),
+            ]),
+            html.Div(style={"minWidth": "250px", "flex": "1"}, children=[
+                html.Label("EMISSOR", style=_label_style()),
+                dcc.Dropdown(id="precos-emissor",
+                             options=[{"label": e, "value": e} for e in emissores],
+                             value=[], clearable=True, multi=True, placeholder="Todos",
+                             style={"fontSize": "13px", "fontFamily": "'Montserrat', sans-serif"}),
+            ]),
+            html.Div(style={"marginLeft": "auto", "display": "flex", "flexDirection": "column", "justifyContent": "flex-end", "textAlign": "right"}, children=[
+                html.Div("ATUALIZAÇÃO DE MERCADO", style={"fontSize": "10px", "fontWeight": "600", "color": TENAX_LIGHT, "letterSpacing": "1.5px", "marginBottom": "2px"}),
+                html.Div(str(date_precos), style={"fontWeight": "700", "color": TENAX_DARK, "fontSize": "13px"}),
             ]),
         ]),
         # Bubble chart
@@ -436,7 +568,32 @@ def _precos_tab_layout(df_precos):
     ])
 
 def create_app(carteira_tx, carteira_new, summary_tx, issuers, pl_total, fund_mapping, lamina_funds, df_precos):
-    app = dash.Dash(__name__, title="Tenax — Issuer Analysis", suppress_callback_exceptions=True)
+    
+    # Computar Tenax x Mercado no df_precos com base na exp total
+    pos_por_ticker = carteira_tx.groupby("Product")["Position"].sum()
+    def get_tenax_expo(ticker):
+        if ticker in pos_por_ticker:
+            pos = pos_por_ticker[ticker]
+            if pos > 0:
+                return pos / pl_total if pl_total else 0
+        return 0
+    df_precos["Tenax_Expo_Pct"] = df_precos["Ticker"].apply(get_tenax_expo)
+    df_precos["Tenax x Mercado"] = df_precos["Tenax_Expo_Pct"].apply(lambda x: "Tenax" if x > 0 else "Mercado")
+
+    app = dash.Dash(__name__, title="Tenax - Credit Dashboard", suppress_callback_exceptions=True)
+    
+    date_carteira = getattr(carteira_tx, "attrs", {}).get("data_atualizacao", "N/A")
+    date_precos = getattr(df_precos, "attrs", {}).get("data_atualizacao", "N/A")
+    
+    if pd.notna(date_carteira) and hasattr(date_carteira, "strftime"):
+        date_carteira = date_carteira.strftime("%d/%m/%Y")
+    elif pd.notna(date_carteira):
+        date_carteira = str(date_carteira).split()[0][:10]
+        
+    if pd.notna(date_precos) and hasattr(date_precos, "strftime"):
+        date_precos = date_precos.strftime("%d/%m/%Y")
+    elif pd.notna(date_precos):
+        date_precos = str(date_precos).split()[0][:10]
 
     # --- Tab 1 columns ---
     base_columns = [
@@ -512,13 +669,13 @@ def create_app(carteira_tx, carteira_new, summary_tx, issuers, pl_total, fund_ma
                     colors={"border": TENAX_CARD_BORDER, "primary": TENAX_PRIMARY, "background": TENAX_BG},
                 ),
                 # Both tabs always in DOM — visibility toggled via callback
-                html.Div(id="tab-issuer-content", children=_issuer_tab_layout(issuers, pl_total, all_columns)),
-                html.Div(id="tab-lamina-content", children=_lamina_tab_layout(lamina_funds, lamina_columns), style={"display": "none"}),
-                html.Div(id="tab-precos-content", children=_precos_tab_layout(df_precos), style={"display": "none"}),
+                html.Div(id="tab-issuer-content", children=_issuer_tab_layout(issuers, pl_total, all_columns, date_carteira)),
+                html.Div(id="tab-lamina-content", children=_lamina_tab_layout(lamina_funds, lamina_columns, date_carteira), style={"display": "none"}),
+                html.Div(id="tab-precos-content", children=_precos_tab_layout(df_precos, date_precos), style={"display": "none"}),
             ]),
             html.Div(style={"textAlign": "center", "marginTop": "16px", "paddingBottom": "24px",
                             "color": TENAX_LIGHT, "fontSize": "11px", "letterSpacing": "1px"},
-                     children=[html.P("TENAX CAPITAL — Issuer Analysis Dashboard")]),
+                     children=[html.P("TENAX CAPITAL")]),
         ],
     )
 
@@ -573,12 +730,16 @@ def create_app(carteira_tx, carteira_new, summary_tx, issuers, pl_total, fund_ma
     # --- Tab 3 callback ---
     @app.callback(
         Output("precos-chart", "figure"),
-        [Input("precos-indexador", "value"),
+        [Input("precos-view", "value"),
+         Input("precos-gross", "value"),
+         Input("precos-indexador", "value"),
          Input("precos-rating", "value"),
-         Input("precos-setor", "value")],
+         Input("precos-setor", "value"),
+         Input("precos-emissor", "value"),
+         Input("precos-color-by", "value")]
     )
-    def update_precos(indexador, rating, setor):
-        return build_precos_fig(df_precos, indexador, rating, setor)
+    def update_precos_chart(view_col, gross_col, indexador_filter, rating_filter, setor_filter, emissor_filter, color_by):
+        return build_precos_fig(df_precos, view_col, gross_col, indexador_filter, rating_filter, setor_filter, emissor_filter, color_by)
 
     return app
 
@@ -599,7 +760,7 @@ def _tab_selected_style():
         "padding": "10px 20px", "letterSpacing": "0.5px", "textTransform": "uppercase",
     }
 
-def _issuer_tab_layout(issuers, pl_total, all_columns):
+def _issuer_tab_layout(issuers, pl_total, all_columns, date_carteira=""):
     return html.Div([
         # Controls row
         html.Div(style={"display": "flex", "gap": "20px", "alignItems": "flex-end",
@@ -616,6 +777,10 @@ def _issuer_tab_layout(issuers, pl_total, all_columns):
                 html.Div("PL TOTAL", style={"fontSize": "10px", "fontWeight": "600",
                                             "color": TENAX_LIGHT, "letterSpacing": "1.5px", "marginBottom": "2px"}),
                 html.Div(f"R$ {pl_total:,.2f}", style={"fontWeight": "700", "color": TENAX_PRIMARY, "fontSize": "18px"}),
+            ]),
+            html.Div(style={"marginLeft": "auto", "display": "flex", "flexDirection": "column", "justifyContent": "flex-end", "textAlign": "right"}, children=[
+                html.Div("ATUALIZAÇÃO DA CARTEIRA", style={"fontSize": "10px", "fontWeight": "600", "color": TENAX_LIGHT, "letterSpacing": "1.5px", "marginBottom": "2px"}),
+                html.Div(str(date_carteira), style={"fontWeight": "700", "color": TENAX_DARK, "fontSize": "13px"}),
             ]),
         ]),
         html.Div(id="summary-cards", style={"display": "flex", "gap": "16px", "marginBottom": "24px", "flexWrap": "wrap"}),
@@ -640,7 +805,7 @@ def _issuer_tab_layout(issuers, pl_total, all_columns):
     ])
 
 
-def _lamina_tab_layout(lamina_funds, lamina_columns):
+def _lamina_tab_layout(lamina_funds, lamina_columns, date_carteira=""):
     return html.Div([
         # Controls row
         html.Div(style={"display": "flex", "gap": "20px", "alignItems": "flex-end",
@@ -670,6 +835,10 @@ def _lamina_tab_layout(lamina_funds, lamina_columns):
                                labelStyle={"display": "inline-block", "marginRight": "14px",
                                            "fontSize": "13px", "cursor": "pointer"},
                                inputStyle={"marginRight": "4px", "accentColor": TENAX_PRIMARY}),
+            ]),
+            html.Div(style={"marginLeft": "auto", "display": "flex", "flexDirection": "column", "justifyContent": "flex-end", "textAlign": "right"}, children=[
+                html.Div("ATUALIZAÇÃO DA CARTEIRA", style={"fontSize": "10px", "fontWeight": "600", "color": TENAX_LIGHT, "letterSpacing": "1.5px", "marginBottom": "2px"}),
+                html.Div(str(date_carteira), style={"fontWeight": "700", "color": TENAX_DARK, "fontSize": "13px"}),
             ]),
         ]),
         # Table
