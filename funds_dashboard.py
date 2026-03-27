@@ -609,7 +609,7 @@ def create_app(carteira_tx, carteira_new, summary_tx, issuers, pl_total, fund_ma
     fund_columns = []
     for fm in fund_mapping:
         fn = fm["fund_name"]
-        short = fn.replace("Tenax ", "").replace(" FIF", "").replace(" FIFE", "")
+        short = fn.replace("Tenax ", "")
         fund_columns.append({"name": f"{short} R$ (%)", "id": f"{fn} R$ (%)"})
     all_columns = base_columns + fund_columns
 
@@ -715,7 +715,7 @@ def create_app(carteira_tx, carteira_new, summary_tx, issuers, pl_total, fund_ma
 
     # --- Tab 2 callback ---
     @app.callback(
-        [Output("lamina-table", "data"), Output("lamina-chart", "figure")],
+        [Output("lamina-table", "data"), Output("lamina-table", "columns"), Output("lamina-chart", "figure")],
         [Input("lamina-fund-dropdown", "value"),
          Input("lamina-ver-tickers", "value"),
          Input("lamina-so-cp", "value")],
@@ -724,8 +724,15 @@ def create_app(carteira_tx, carteira_new, summary_tx, issuers, pl_total, fund_ma
         rows, fig = build_lamina(fund, ver_tickers, so_cp, carteira_tx, carteira_new)
         # Remove internal keys before passing to table
         clean_rows = [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows]
-        # Row styling: emissor rows bold
-        return clean_rows, fig
+        # When tickers are hidden, show only Emissor + Posição Emissor
+        if ver_tickers == "Não":
+            cols = [
+                {"name": "Emissor", "id": "Emissor"},
+                {"name": "Posição Emissor R$ (%)", "id": "Posição Emissor R$ (%)"},
+            ]
+        else:
+            cols = lamina_columns
+        return clean_rows, cols, fig
 
     # --- Tab 3 callback ---
     @app.callback(
